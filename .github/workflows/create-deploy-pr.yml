@@ -26,6 +26,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+      issues: write
 
     steps:
       - name: Checkout
@@ -142,6 +143,18 @@ jobs:
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
 
+      - name: Ensure release label exists
+        if: steps.check_changes.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! gh label list --json name --jq '.[].name' | grep -q "^release$"; then
+            echo "Creating 'release' label..."
+            gh label create "release" --color "0E8A16" --description "Production release PR"
+          else
+            echo "'release' label already exists"
+          fi
+
       - name: Create Deploy PR
         if: steps.check_pr.outputs.exists == 'false' && steps.check_changes.outputs.has_changes == 'true'
         env:
@@ -167,7 +180,8 @@ jobs:
             --base "${{ inputs.target_branch }}" \
             --head "${{ inputs.source_branch }}" \
             --title "${{ inputs.pr_title }}" \
-            --body "$pr_body"
+            --body "$pr_body" \
+            --label "release"
 
       - name: Update existing Deploy PR
         if: steps.check_pr.outputs.exists == 'true' && steps.check_changes.outputs.has_changes == 'true'
