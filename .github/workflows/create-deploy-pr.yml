@@ -1,0 +1,195 @@
+name: Create Deploy to Production PR
+
+on:
+  workflow_call:
+    inputs:
+      source_branch:
+        description: "Source branch to deploy from"
+        required: false
+        type: string
+        default: "main"
+      target_branch:
+        description: "Target branch to deploy to"
+        required: false
+        type: string
+        default: "release"
+      pr_title:
+        description: "Title for the deploy PR"
+        required: false
+        type: string
+        default: "Deploy to production"
+
+jobs:
+  create_deploy_pr:
+    name: Create deployment PR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for existing deploy PR
+        id: check_pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          existing_pr=$(gh pr list --base "${{ inputs.target_branch }}" --head "${{ inputs.source_branch }}" --state open --json number,title --jq '.[] | select(.title == "${{ inputs.pr_title }}") | .number')
+          if [[ -n "$existing_pr" ]]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "pr_number=$existing_pr" >> "$GITHUB_OUTPUT"
+            echo "Deploy PR already exists: #$existing_pr"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check if there are changes to deploy
+        id: check_changes
+        run: |
+          git fetch origin "${{ inputs.target_branch }}"
+          changes=$(git rev-list --count "origin/${{ inputs.target_branch }}..origin/${{ inputs.source_branch }}")
+          if [[ "$changes" -eq 0 ]]; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "No changes to deploy"
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo "Found $changes commits to deploy"
+          fi
+
+      - name: Generate changelog
+        id: changelog
+        if: steps.check_changes.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git fetch origin "${{ inputs.target_branch }}"
+
+          echo "Generating changelog from ${{ inputs.target_branch }} to ${{ inputs.source_branch }}..."
+
+          # Extract PR numbers from commit messages
+          # Handles both merge commits ("Merge pull request #123") and squash merges ("... (#123)")
+          pr_numbers=$(git log "origin/${{ inputs.target_branch }}..origin/${{ inputs.source_branch }}" --first-parent --oneline 2>/dev/null | \
+            grep -oE '(Merge pull request #[0-9]+|\(#[0-9]+\))' | \
+            grep -oE '[0-9]+' | \
+            sort -u -n || echo "")
+
+          changelog="## Release Pull Requests\n\n"
+          summary="## Release Summary\n\n"
+          pr_count=0
+
+          if [[ -n "$pr_numbers" ]]; then
+            while IFS= read -r pr_num; do
+              if [[ -n "$pr_num" ]]; then
+                # Get PR details
+                pr_info=$(gh pr view "$pr_num" --json title,author,body --jq '{title: .title, author: .author.login, body: .body}' 2>/dev/null || echo "")
+                if [[ -n "$pr_info" ]]; then
+                  pr_title=$(echo "$pr_info" | jq -r '.title')
+                  pr_author=$(echo "$pr_info" | jq -r '.author')
+                  pr_body=$(echo "$pr_info" | jq -r '.body // ""')
+
+                  # Skip if this is a deploy PR
+                  if [[ "$pr_title" == "${{ inputs.pr_title }}" ]]; then
+                    continue
+                  fi
+
+                  changelog+="- #${pr_num} by @${pr_author}\n"
+
+                  # Extract summary from PR body (text after "What does this PR do?")
+                  pr_summary=$(echo "$pr_body" | sed -n '/What does this PR do?/,/#/p' | head -n -1 | tail -n +2 | xargs)
+                  if [[ -z "$pr_summary" || ${#pr_summary} -lt 5 ]]; then
+                    pr_summary="$pr_title"
+                  fi
+                  summary+="- ${pr_summary}\n"
+
+                  pr_count=$((pr_count + 1))
+                fi
+              fi
+            done <<< "$pr_numbers"
+          fi
+
+          # Fallback to commits if no PRs found
+          if [[ "$pr_count" -eq 0 ]]; then
+            changelog="## Commits\n\n"
+            changelog+="_No merged PRs detected. Showing commits instead:_\n\n"
+            commit_log=$(git log "origin/${{ inputs.target_branch }}..origin/${{ inputs.source_branch }}" --oneline --no-merges | head -20 || echo "No commits found")
+            while IFS= read -r line; do
+              if [[ -n "$line" ]]; then
+                changelog+="- ${line}\n"
+              fi
+            done <<< "$commit_log"
+
+            total_commits=$(git rev-list --count "origin/${{ inputs.target_branch }}..origin/${{ inputs.source_branch }}" --no-merges 2>/dev/null || echo "0")
+            if [[ "$total_commits" -gt 20 ]]; then
+              changelog+="\n_...and $((total_commits - 20)) more commits_\n"
+            fi
+            summary=""
+          fi
+
+          # Combine changelog and summary
+          body="${changelog}"
+          if [[ -n "$summary" ]]; then
+            body+="\n${summary}"
+          fi
+
+          # Save as multiline output
+          {
+            echo 'content<<EOF'
+            echo -e "$body"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create Deploy PR
+        if: steps.check_pr.outputs.exists == 'false' && steps.check_changes.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          pr_body="## What does this PR do?
+
+          This PR deploys changes from \`${{ inputs.source_branch }}\` branch to \`${{ inputs.target_branch }}\` branch for production deployment.
+
+          ${{ steps.changelog.outputs.content }}
+
+          ---
+
+          ## Checklist
+
+          - [ ] Reviewed the changes
+          - [ ] Verified staging deployment is stable
+          - [ ] Ready for production deployment
+
+          **Workflow Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          gh pr create \
+            --base "${{ inputs.target_branch }}" \
+            --head "${{ inputs.source_branch }}" \
+            --title "${{ inputs.pr_title }}" \
+            --body "$pr_body" \
+            --label "release"
+
+      - name: Update existing Deploy PR
+        if: steps.check_pr.outputs.exists == 'true' && steps.check_changes.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          pr_body="## What does this PR do?
+
+          This PR deploys changes from \`${{ inputs.source_branch }}\` branch to \`${{ inputs.target_branch }}\` branch for production deployment.
+
+          ${{ steps.changelog.outputs.content }}
+
+          ---
+
+          ## Checklist
+
+          - [ ] Reviewed the changes
+          - [ ] Verified staging deployment is stable
+          - [ ] Ready for production deployment
+
+          **Workflow Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          gh pr edit ${{ steps.check_pr.outputs.pr_number }} --body "$pr_body"
+          echo "Updated existing PR #${{ steps.check_pr.outputs.pr_number }}"
