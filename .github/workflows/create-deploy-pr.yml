@@ -167,8 +167,7 @@ jobs:
             --base "${{ inputs.target_branch }}" \
             --head "${{ inputs.source_branch }}" \
             --title "${{ inputs.pr_title }}" \
-            --body "$pr_body" \
-            --label "release"
+            --body "$pr_body"
 
       - name: Update existing Deploy PR
         if: steps.check_pr.outputs.exists == 'true' && steps.check_changes.outputs.has_changes == 'true'
