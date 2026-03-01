@@ -71,18 +71,26 @@ jobs:
 
           echo "Generating changelog from ${{ inputs.target_branch }} to ${{ inputs.source_branch }}..."
 
+          # Get all first-parent commits in range
+          all_first_parent=$(git log "origin/${{ inputs.target_branch }}..origin/${{ inputs.source_branch }}" --first-parent --oneline 2>/dev/null || echo "")
+
           # Extract PR numbers from commit messages
           # Handles both merge commits ("Merge pull request #123") and squash merges ("... (#123)")
-          pr_numbers=$(git log "origin/${{ inputs.target_branch }}..origin/${{ inputs.source_branch }}" --first-parent --oneline 2>/dev/null | \
+          pr_numbers=$(echo "$all_first_parent" | \
             grep -oE '(Merge pull request #[0-9]+|\(#[0-9]+\))' | \
             grep -oE '[0-9]+' | \
             sort -u -n || echo "")
 
-          changelog="## Release Pull Requests\n\n"
+          # Find direct commits (not associated with any PR merge)
+          direct_commits=$(echo "$all_first_parent" | \
+            grep -vE '(Merge pull request #[0-9]+|\(#[0-9]+\))' || echo "")
+
+          changelog=""
           summary="## Release Summary\n\n"
           pr_count=0
 
           if [[ -n "$pr_numbers" ]]; then
+            changelog="## Release Pull Requests\n\n"
             while IFS= read -r pr_num; do
               if [[ -n "$pr_num" ]]; then
                 # Get PR details
@@ -112,8 +120,32 @@ jobs:
             done <<< "$pr_numbers"
           fi
 
-          # Fallback to commits if no PRs found
-          if [[ "$pr_count" -eq 0 ]]; then
+          # Always include direct commits (commits not associated with a PR)
+          direct_count=0
+          if [[ -n "$direct_commits" ]]; then
+            while IFS= read -r line; do
+              if [[ -n "$line" ]]; then
+                direct_count=$((direct_count + 1))
+              fi
+            done <<< "$direct_commits"
+          fi
+
+          if [[ "$direct_count" -gt 0 ]]; then
+            changelog+="\n## Direct Commits\n\n"
+            shown=0
+            while IFS= read -r line; do
+              if [[ -n "$line" && "$shown" -lt 20 ]]; then
+                changelog+="- ${line}\n"
+                shown=$((shown + 1))
+              fi
+            done <<< "$direct_commits"
+            if [[ "$direct_count" -gt 20 ]]; then
+              changelog+="\n_...and $((direct_count - 20)) more commits_\n"
+            fi
+          fi
+
+          # Fallback if no PRs and no direct commits found
+          if [[ "$pr_count" -eq 0 && "$direct_count" -eq 0 ]]; then
             changelog="## Commits\n\n"
             changelog+="_No merged PRs detected. Showing commits instead:_\n\n"
             commit_log=$(git log "origin/${{ inputs.target_branch }}..origin/${{ inputs.source_branch }}" --oneline --no-merges | head -20 || echo "No commits found")
@@ -127,6 +159,11 @@ jobs:
             if [[ "$total_commits" -gt 20 ]]; then
               changelog+="\n_...and $((total_commits - 20)) more commits_\n"
             fi
+            summary=""
+          fi
+
+          # Clear summary if only direct commits (no PR summaries to show)
+          if [[ "$pr_count" -eq 0 ]]; then
             summary=""
           fi
 
